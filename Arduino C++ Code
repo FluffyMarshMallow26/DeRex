@@ -1,0 +1,1318 @@
+//  
+//  Dexcom "De-Rex" BLE Repeater Project
+//  Arizona State University
+//  8 Jan 2021 - 27 Apr 2021
+//
+//  This code is (ultimately) designed to identify and re-broadcast
+//  data packets from a Dexcom transmitter to an endpoint such as a
+//  smartphone or the Dexcom receiver.
+//
+//  The target of this is an Arduino Nano 33 IoT
+//  An Arduino Nano BLE "might" work, too but was not tested
+//
+//  8  Jan 2021 :  Initial revision using Arduino examples
+//  14 Jan 2021 :  Separated code into setup and loop instead of just setup
+//  28 Jan 2021 :  Realised scan() is a background process, put into setup
+//  1  Feb 2021 :  Added some basic attribute and characteristic sections
+//  2  Feb 2021 :  Used Service ID from BT SIG document for Dexcom (0xFEBC)
+//  8  Feb 2021 :  Can see Dexcom advert for G5 and G6 (can't connect)
+//  10 Feb 2021 :  need stopScan() to prep transmitter for connection
+//  11 Feb 2021 :  able to view the discrete UUIDs for characteristics
+//  12 Feb 2021 :  start of rewrite into discrete functions instead of one loop
+//  15 Feb 2021 :  working again - really struggled with parameter passing
+//  16 Feb 2021 :  finally figured out how to read characteristic data
+//  17 Feb 2021 :  starting integration of peripheral functionality
+//  20 Feb 2021 :  can read all properties from a peripheral
+//  25 Feb 2021 :  can advertise first captured device (top-level + services only)
+//  27 Feb 2021 :  first successful test of 2-Arduino relay (one-way)
+//  3  Mar 2021 :  advertising characteristics works, although not sure why
+//  7  Mar 2021 :  descriptors seem to work; memory usage high to repeat 1 device
+//  9  Mar 2021 :  basic subscription detection and central writing working
+//  18 Mar 2021 :  seeing memory issues - not sure if leak or other corruption
+//  23 Mar 2021 :  start of rewrite:  reduce/eliminate String()
+//  26 Mar 2021 :  end of rewrite:  memory usage severely underestimated
+//  29 Mar 2021 :  problems connecting/disconnect with other Arduinos
+//  3  Apr 2021 :  ghost attributes fixed with ArduinoBLE library mod (GATT.cpp)
+//  4  Apr 2021 :  started write-back coding (pending commands)
+//  12 Apr 2021 :  first relay of data between iPhone and one Arduino repeater
+//  13 Apr 2021 :  first attempt to pair Dexcom transmitter with Dexcom G6 app (failed)
+//  20 Apr 2021 :  callback routine keeps hanging - something with connect()/disconnect()
+//  21 Apr 2021 :  added stale indicator to refresh profile data in the tables
+//  23 Apr 2021 :  connect() takes longer after first time - causes subsequent connects to fail
+//  26 Apr 2021 :  end of project.  Was not able to sustain comms with Dexcom transmitter
+
+
+// include any libraries or functions here
+#include <ArduinoBLE.h>
+
+
+//************************************************************************//
+// Variable Declaration                                                   //
+//************************************************************************//
+
+const byte SM = 8;                              // services array multiplier
+const byte CM = 16;                             // characteristics array multiplier
+const byte DM = 32;                             // descriptors array multiplier
+const byte MAX_CMDS = 128;                       // number of callback commands allowed
+const byte MAX_NODES = 1;                       // maximum num. of BLE devices supported
+const char DEXCOM_UUID[5] = {"febc"};           // Dexcom corporate service ID + null
+const int MAX_BYTES = 24;                       // max. char. or desc. data buffer size
+const int MAX_HIT_TIME = 5500;                  // rejection time for multiple advertisements
+const int C2P_DELAY = 45;                       // central to peripheral wait time in ms
+const int P2C_DELAY = 45;                       // peripheral to central wait time in ms
+const int C2P_DELAY_FAST = 0;                   // reduced delay when central connects, in ms
+const int P2C_DELAY_FAST = 0;                   // reduced delay when central connect, in ms
+//const word P_APPEARANCE = 0x181F;               // optional advertising info - "CGM"
+const long CENTRAL_TIMEOUT = 4250;              // auto-break from dead central (ms)
+const word P_APPEARANCE = 0x0000;               // appearance value Dexcom has chosen
+const uint16_t COMPANY_ID = 0x00d0;             // mfg data - peripheral code
+
+bool centralScanning = false;                   // pretty much what it says
+bool periphAdvertising = false;                 // again, self explanatory
+bool staleDB[MAX_NODES] = {false};              // array that correlates to stale profiles
+bool stale = false;                             // aggregate boolean for quick decisions
+bool connectFlag = false;                       // stable BLE connection indicator
+bool repeatForever = true;                      // false = stop after 1 scan, true = repeats
+bool initDone = false;                          // for bypassing peripheral code setup
+bool centCon = false;                           // toggle for turning off repeated messages
+bool activePeriph = false;                      // peripheral queued for advertising
+bool cmdPending = false;                        // (placeholder)
+
+byte cmd[MAX_CMDS] = {0};                       // pending activity FIFO
+byte cmdPtr = 0;                                // pointer into the command FIFO
+byte hbCount = 0;                               // aesthetically pleasing heartbeat
+byte advCount = 0;                              // pointer to next device to be advertised
+byte devCount = 0;                              // number of devices found
+byte servCountPer = 0;                          // services counter, per device
+byte charCountPer = 0;                          // characteristics counter, per device
+byte descCountPer = 0;                          // descriptors counter, per device
+byte mfgBuf[2] = {0, 3};                        // advertising data - must be global!
+byte charDBProps[MAX_NODES * CM] = {0};         // characteristic properties buffers 
+byte charDBData[MAX_NODES * CM][MAX_BYTES] = {0};       // characteristic data buffers
+byte descDBData[MAX_NODES * DM][MAX_BYTES] = {0};       // descriptors data buffers
+
+char cmdUUID[MAX_CMDS][37] = {0};               // characteristic writeback UUID buffer
+char periphDBAddr[MAX_NODES][18] = {'\0'};      // device MAC address buffers
+char periphDBName[MAX_NODES][9] = {'\0'};       // device localName buffers
+char periphDBUUID[MAX_NODES][5] = {'\0'};       // device UUID buffers
+char servDBUUID[MAX_NODES * SM][37] = {'\0'};   // service UUID buffers
+char charDBUUID[MAX_NODES * CM][37] = {'\0'};   // characteristic UUID buffers
+char descDBUUID[MAX_NODES * DM][37] = {'\0'};   // descriptor UUID buffers
+
+float version = 25.6;                           // version control?  What version control?
+
+int countDBServ[MAX_NODES] = {0};               // (volatile) total services count
+int countDBChar[MAX_NODES] = {0};               // (volatile) total characteristics count
+int countDBDesc[MAX_NODES] = {0};               // (volatile) total descriptors count
+int servCount = 0;                              // services counter, total
+int charCount = 0;                              // characteristics counter, total
+int descCount = 0;                              // descriptors counter, total
+int oldServCount = 0;                           // previous serv count (for bad connection)
+int oldCharCount = 0;                           // previous char count (for bad connection)
+int oldDescCount = 0;                           // previous desc count (for bad connection)
+int c2pDelay = C2P_DELAY;                       // programmable c->p wait time in ms
+int p2cDelay = P2C_DELAY;                       // programmable p->c wait time in ms
+
+long hitStartTime = millis();                   // rejection timer for back-to-back adverts
+long centralRunTime = 0;                        // dead central disconnect timer
+
+signed char MIN_GOOD_RSSI = -90;                // minimum power level before auto-disconnect
+
+unsigned char servDBDevNum[MAX_NODES * SM] = {0};       // service device reference
+unsigned char charDBServNum[MAX_NODES * CM] = {0};      // characteristic service reference
+unsigned char descDBCharNum[MAX_NODES * DM] = {0};      // descriptor characteristic reference
+unsigned int charDBDataLen[MAX_NODES * CM] = {0x0000};  // characteristic data bufs len (bytes)
+unsigned int descDBDataLen[MAX_NODES * DM] = {0x0000};  // descriptor data bufs len (bytes)
+
+BLEDevice central;                                      // globally declared for all functions
+BLEDevice peripheral;                                   // globally declared for all functions
+BLEService servDexcom;                                  // variable for BLE service
+BLECharacteristic charDexcom;                           // variable for BLE characteristic
+BLEDescriptor descDexcom;                               // variable for BLE descriptor
+BLEService pService[MAX_NODES * SM] = {};               // periph. serv. objects - global
+BLECharacteristic pCharacteristic[MAX_NODES * CM] = {}; // periph. char. objects - global
+BLEDescriptor pDescriptor[MAX_NODES * DM] = {};         // periph. desc. objects - global
+
+
+//************************************************************************//
+// Setup                                                                  //
+//************************************************************************//
+void setup() {
+
+  pinMode(LED_BUILTIN, OUTPUT);                 // visible connection indicator
+  Serial.begin(115200);                         // faster speed loses less messages
+//  while (!Serial);                              // comment this out for standalone
+
+  resetIndicator();
+  initBluetoothHardware(repeatForever);
+  scanForPeripherals(DEXCOM_UUID);
+}
+
+//************************************************************************//
+// Main Loop                                                              //
+//************************************************************************//
+void loop() {
+
+  // *** CENTRAL section
+  //
+  // the central code scans for peripherals (Dexcom transmitters
+  // or other Arduino modules that repeat Dexcom profiles)
+
+  if ((devCount < MAX_NODES) || cmdPending || stale) {
+    
+    peripheral = BLE.available();               // any advertising BLE devices?
+
+    if (peripheral) {
+      getTransmitPower();                       // capture RSSI now (can't get it later)
+
+      if (cmdPending) {
+        processPendingCommands();               // writebacks, notifications (if any)
+      } else {
+
+        if (getPeripheralAttributes()) {        // get BLE general qualities
+          stopScanningForPeripherals();         // turn off scanner, switch to interrogator
+          managePeripheralConnection();         // Arduino talks to a peripheral (server)
+      
+          if (repeatForever && ((devCount < MAX_NODES) || cmdPending || stale)) {
+            scanForPeripherals(DEXCOM_UUID);
+          } else {
+            stopScanningForPeripherals();
+          }
+        }
+      }
+    }
+  } 
+
+  // *** DEBUG dump section
+  //
+  // The dump size - no pun intended - can affect loop performance.  In some
+  // cases, dumping a lot of table data can cause intermittent disconnects
+
+  if (!centCon) {
+    Serial.print("TABLE DATA: devCount = ");
+    Serial.print(devCount);
+    Serial.print(" servCount = ");
+    Serial.print(servCount);
+    Serial.print(" charCount = ");
+    Serial.print(charCount);
+    Serial.print(" descCount = ");
+    Serial.print(descCount);
+    Serial.print(" cmdPending = ");
+    Serial.print(cmdPending);
+    Serial.print(" cmdPtr = ");
+    Serial.print(cmdPtr);
+    Serial.print(" scan = ");
+    Serial.print(centralScanning);
+    Serial.print(" advert = ");
+    Serial.print(periphAdvertising);
+    Serial.print(" stale = ");
+    Serial.println(stale);
+//    Serial.println(BLE.debug(Serial));          // neat-o! but undocumented ... Mongo sad
+  }
+  delay(c2pDelay);
+
+  // *** PERIPHERAL section
+  //
+  // the peripheral code advertises for devices (smartphones
+  // or other Arduino modules scanning for Dexcom profiles)
+
+  if (devCount) {
+
+    if (devCount > 0 && !initDone) {
+
+      if (initPeripheralAdvertising()) {        // build a GATT profile
+        createPeripheralServices();
+        startAdvertising();
+        initDone = true;
+      }
+    }
+    central = BLE.central();
+
+    manageCentralConnection();                  // Arduino talks to a central (client)
+  }
+  heartBeat();                                  // still kicking indicator + housekeeper
+  delay(p2cDelay);
+}
+
+//************************************************************************//
+// initBluetoothHardware (central function)                               //
+//  inputs  : continuous loop indicator                                   //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void initBluetoothHardware(bool loopFlag) {
+
+  // initialize the BLE hardware, tell user about awesome program
+  BLE.begin();
+
+  Serial.println();
+  Serial.print("Dexcom 2020 - Transmitter Discovery v");
+  Serial.println(version, 1);
+  Serial.print("Program set to ");
+  if (loopFlag) {
+    Serial.println("run continuously");
+  } else {
+    Serial.println("run one loop");
+  }
+    // these appear to have no effect (ArduinoBLE 1.2.0 library)
+//  BLE.setAdvertisingInterval(320);              // 320 * 0.625 = 2 ms, 625 us int.
+//  BLE.setConnectionInterval(6, 3200);           // 7.5 ms min, 4 s max, 1.25 ms int.
+//  BLE.setSupervisionTimeout(800);
+}
+
+//************************************************************************//
+// scanForPeripherals (central function)                                  //
+//  inputs  : UUID pointer to scan for                                    //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void scanForPeripherals(const char *peripheralUUID) {
+
+  // start looking for BLE peripherals - UUID parameter makes it specific
+  if (!centralScanning) {
+    BLE.scanForUuid(peripheralUUID, false);
+    Serial.println("Scanning started");
+    centralScanning = true;
+  }
+}
+
+//************************************************************************//
+// stopScanningForPeripherals (central function)                          //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void stopScanningForPeripherals(void) {
+
+  // stop looking for BLE peripheral advertisements
+  if (centralScanning) {
+    BLE.stopScan();
+    Serial.println("Scanning stopped");
+    centralScanning = false;
+  }
+}
+
+//************************************************************************//
+// getTransmitPower (central function)                                    //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+signed char getTransmitPower(void) {
+
+  return peripheral.rssi();                     // "outside" measurement (?)
+}
+
+//************************************************************************//
+// connectPeripheral (central function)                                   //
+//  inputs  : nuthin                                                      //
+//  outputs : connected to device or didn't                               //
+//************************************************************************//
+bool connectPeripheral(void) {
+
+  // test for a valid and stable BLE connection after starting a scan
+  bool connectFlag = false;
+  signed char txPower = getTransmitPower();
+  Serial.print(" Connecting ...");
+
+  if (txPower >= MIN_GOOD_RSSI) {               // helps prevent crashes
+    if (peripheral.connect()) {
+
+      digitalWrite(LED_BUILTIN, HIGH);
+      Serial.print(" connected at ");
+      Serial.print(txPower);
+      Serial.println(" dBm");
+      connectFlag = true;
+    } else {
+      if (peripheral.connected()) disconnectPeripheral();
+      Serial.println(" failed to connect!");
+      Serial.println(" *** Connection failure - ignoring device ***");
+    }
+  } else {
+    Serial.print(" failed to connect!  (power = ");
+    Serial.print(txPower);
+    Serial.println(" dBm)");
+    Serial.println(" *** Low power - ignoring device ***");
+    if (peripheral.connected()) disconnectPeripheral();
+  }
+
+  return connectFlag;
+}
+
+//************************************************************************//
+// disconnectPeripheral (central function)                                //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void disconnectPeripheral(void) {
+
+  // disconnect from a BLE peripheral
+  if (peripheral.connected()) peripheral.disconnect();
+  while (peripheral.connected()) {              // this trap occurs after several hours
+    peripheral.disconnect();                    // nothing to do but reset ... and cry
+    Serial.println(".");
+  }
+  digitalWrite(LED_BUILTIN, LOW);
+  Serial.println(" Peripheral disconnected");
+}
+
+//************************************************************************//
+// managePeripheralconnection (central function)                          //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void managePeripheralConnection(void) {
+
+  if (connectPeripheral()) {
+
+    if (!stale) {
+
+      if (getPeripheralServices()) {
+        oldServCount = servCount;
+        oldCharCount = charCount;                 // success, bump all counters
+        oldDescCount = descCount;
+        devCount++;
+      } else {
+        Serial.print(" *** Connection failure - resetting for device ");
+        Serial.print(periphDBName[devCount]);
+        Serial.println(" ***");
+        servCount = oldServCount;
+        charCount = oldCharCount;
+        descCount = oldDescCount;
+      }
+      
+    } else {
+
+      if (getPeripheralServices()) {
+        Serial.print(" ***  ");
+        Serial.print(periphDBName[advCount]);
+        Serial.println(" profile successfully refreshed! ***");
+        oldServCount = servCount;
+        oldCharCount = charCount;                 // success, bump all counters
+        oldDescCount = descCount;
+        staleDB[advCount] = false;
+      } else {
+        Serial.print(" *** Refresh failure - retrying for ");
+        Serial.print(periphDBName[advCount]);
+        Serial.println(" ***");
+        servCount = oldServCount;
+        charCount = oldCharCount;
+        descCount = oldDescCount;
+      }
+    }
+
+  } else {
+
+      Serial.print(" *** Connection failure - resetting for device ");
+      if (!stale) {
+        Serial.print(periphDBName[devCount]);
+        Serial.print(" ***");
+      } else {
+        Serial.print(periphDBName[advCount]);
+        Serial.print(" ***");
+      }
+      servCount = oldServCount;
+      charCount = oldCharCount;
+      descCount = oldDescCount;
+  }
+
+  if (peripheral.connected()) disconnectPeripheral();
+}
+
+//************************************************************************//
+// getPeripheralAttributes (central function)                             //
+//  inputs  : number of devices found/saved                               //
+//  outputs : found unique device or didn't                               //
+//************************************************************************//
+bool getPeripheralAttributes(void) {
+
+  // if a unique peripheral exists, display/save all its attributes
+  bool dupe = false;
+  bool returnFlag = false;
+  byte marker1 = 0;
+  byte marker2 = 0;
+  String devAddress = peripheral.address();
+  String periphName = peripheral.localName();
+  String periphUUID = peripheral.advertisedServiceUuid();
+
+  // collect profile data from the peripheral
+  // if the profile is already stored and a callback is needed, refresh it
+  // if the same advertisement is picked up too quickly, reject it
+  
+  if ((millis() - hitStartTime) > MAX_HIT_TIME) {
+
+    for (byte d = 0; d < devCount; d++) {
+
+      if (!staleDB[d]) {
+
+        if ((periphDBName[d] == periphName) && (periphName.length() > 3)) {
+          Serial.print(" *** Duplicate entry found: ");
+          Serial.print(periphName);
+          Serial.println(" - ignoring device ***");
+          dupe = true;
+        } 
+      } else if ((periphDBName[d] == periphName) && (periphName.length() > 3)) {
+        Serial.print(" *** Stale entry: ");
+        Serial.print(periphDBName[d]);
+        Serial.println(" - refreshing profile ***");
+        if (devCount <= 1) {
+          servCount = 0;
+          charCount = 0;
+          descCount = 0;
+        } else {
+          servCount = countDBServ[devCount - 2];
+          charCount = countDBChar[devCount - 2];
+          descCount = countDBDesc[devCount - 2];
+        }
+      } else {
+        Serial.println(" *** Non-stale entry - ignoring device ***");
+        devAddress = "";
+        dupe = true;
+      }
+    }
+    
+    if (!dupe) {
+      Serial.println();
+      Serial.print("Found ");
+      Serial.print(devAddress);
+      Serial.print(" '");
+      Serial.print(periphName);
+      Serial.print("' 0x");
+      Serial.println(periphUUID);
+
+      // if the scan wasn't corrupted or terminated, save the data in the tables
+      if ((devAddress != "") && (periphName != "") && (periphUUID != "")) {
+        if (!staleDB[advCount]) {
+//        if (true) {
+          devAddress.toCharArray(periphDBAddr[devCount], sizeof(periphDBAddr[devCount]));
+          periphName.toCharArray(periphDBName[devCount], sizeof(periphDBName[devCount]));
+          periphUUID.toCharArray(periphDBUUID[devCount], sizeof(periphDBUUID[devCount]));
+          servCountPer = 0;
+          charCountPer = 0;
+          descCountPer = 0;
+          returnFlag = true;
+        } else {
+          servCountPer = 0;
+          charCountPer = 0;
+          descCountPer = 0;
+          returnFlag = true;
+        }
+      }
+    }
+  }
+  
+  hitStartTime = millis();                      // discard repeated adverts on other channels
+
+  return returnFlag;
+}
+
+//************************************************************************//
+// getPeripheralServices (central function)                               //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+bool getPeripheralServices(void) {
+
+  // extract services from the peripheral; characteristics and descriptors
+  // functions are nested here as it is easier then passing indexing params
+  // (it's easier == we're terrible programmers)
+
+  bool returnFlag = false;
+
+  if (peripheral.discoverAttributes()) {        // VERY IMPORTANT - unlocks stuff
+
+    byte numServices = peripheral.serviceCount();
+    Serial.println(" Discovering peripheral profile");
+//    Serial.print("  Number of services found: ");
+//    Serial.println(numServices);
+
+    for (int s = 0; s < numServices; s++) {
+      servDexcom = peripheral.service(s);
+      String servUUID = servDexcom.uuid();
+//      Serial.print("  Service ");
+//      Serial.print(s);
+//      Serial.print(": 0x");
+//      Serial.println(servUUID);
+
+      // filter services' UUIDs here ("null" = all-pass)
+      if (servUUID == "null") {
+
+        returnFlag = true;
+
+      } else {
+
+        if ((peripheral.connected()) && (servUUID.length() > 3)) {
+
+          if (getPeripheralCharacteristics()) {
+
+            if (!staleDB[advCount]) {
+              servDBDevNum[servCount] = devCount;
+              countDBServ[devCount] = servCountPer + 1;
+            }
+            servUUID.toCharArray(servDBUUID[servCount], sizeof(servDBUUID[servCount]));
+            servCount++;
+            servCountPer++;
+            returnFlag = true;
+
+          } else {
+            s = numServices;                      // flag as bad, break out of loop
+            returnFlag = false;
+          }
+
+        } else {
+          s = numServices;                      // flag as bad, break out of loop
+          returnFlag = false;
+        }
+      }
+    }
+  }
+//  staleDB[0] = true;
+//  Serial.print("  Services return flag = ");
+//  Serial.println(returnFlag);
+  return returnFlag;
+}
+
+//************************************************************************//
+// getPeripheralCharacteristics (central function)                        //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+bool getPeripheralCharacteristics(void) {
+
+  // BLE characteristic property bit mask (0x3F : left = msb, right = lsb)
+  // BLEIndicate, BLENotify, BLEWrite, BLEWriteWithoutResponse, BLERead, BLEBroadcast
+
+  bool returnFlag = false;
+  byte numCharacteristics = 0;
+
+  numCharacteristics = servDexcom.characteristicCount();
+//  Serial.print("   Number of characteristics found: ");
+//  Serial.println(numCharacteristics);
+
+  if (numCharacteristics > 0) {
+    for (int c = 0; c < numCharacteristics; c++) {
+      charDexcom = servDexcom.characteristic(c);
+      String charUUID = charDexcom.uuid();
+      byte charProps = charDexcom.properties();
+      word cLen = 0;
+//      Serial.print("   Characteristic ");
+//      Serial.print(c);
+//      Serial.print(": 0x");
+//      Serial.print(charUUID);
+//      Serial.print(" 0x");
+//      Serial.print(charProps, HEX);
+
+      if (charDexcom.canRead()) {
+//        Serial.print(" readable!");
+        charDexcom.read();                      // starts a "read cycle request"
+        cLen = charDexcom.valueLength();
+//        Serial.print(" [");
+//        Serial.print(cLen);
+//        Serial.print("]");
+        charDexcom.readValue(charDBData[charCount], cLen);
+        for (int v = 0; v < cLen; v++) {
+//          Serial.print(" ");
+//          Serial.print(charDBData[charCount][v]);
+        }
+      } else {
+//        Serial.print(" not readable");
+      }
+//      if (charDexcom.canSubscribe()) Serial.print(" subscribable!");
+//      if (charDexcom.canWrite()) Serial.print(" writeable!");
+//      Serial.println();
+
+      // filter characteristics' UUIDs here ("null" = all-pass)
+      if (charUUID == "null") {
+
+        returnFlag = true;
+
+      } else {
+        
+        if ((peripheral.connected()) && (charUUID.length() > 3)) {
+
+          if (getPeripheralDescriptors()) {
+
+            if (!staleDB[advCount]) {
+              charDBServNum[charCount] = servCount;
+              countDBChar[devCount] = charCountPer + 1;
+            }
+            charUUID.toCharArray(charDBUUID[charCount], sizeof(charDBUUID[charCount]));
+            charDBProps[charCount] = charProps;
+            charDBDataLen[charCount] = (unsigned int)(cLen);
+            charCount++;
+            charCountPer++;
+            returnFlag = true;
+            
+          } else {
+            c == numCharacteristics;
+            returnFlag = false;
+          }
+          
+        } else {
+          c == numCharacteristics;
+          returnFlag = false;
+        }
+      }
+    }
+  } else {
+    returnFlag = true;                          // no characteristics - weird, but possible
+  }
+
+//  Serial.print("   Characteristics return flag = ");
+//  Serial.println(returnFlag);
+  return returnFlag;
+}
+
+//************************************************************************//
+// getPeripheralDescriptors (central function)                            //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+bool getPeripheralDescriptors(void) {
+
+  bool returnFlag = false;
+  byte numDescriptors = 0;
+
+  numDescriptors = charDexcom.descriptorCount();
+//  Serial.print("    Number of descriptors found: ");
+//  Serial.println(numDescriptors);
+
+  if (numDescriptors > 0) {
+    for (int d = 0; d < numDescriptors; d++) {
+      descDexcom = charDexcom.descriptor(d);
+      String descUUID = descDexcom.uuid();
+//      Serial.print("    Descriptor ");
+//      Serial.print(d);
+//      Serial.print(": 0x");
+//      Serial.print(descUUID);
+
+      descDexcom.read();
+      word dLen = descDexcom.valueLength();
+//      Serial.print(" [");
+//      Serial.print(dLen);
+//      Serial.print("]");
+
+      descDexcom.readValue(descDBData[descCount], dLen);
+//      for (int g = 0; g < dLen; g++) {
+//        Serial.print(" ");
+//        Serial.print(descDBData[descCount][g]);
+//      }
+//      Serial.println();
+
+      // filter descriptors' UUIDs here ("null" = all-pass)
+      if (descUUID == "null") {
+        
+        returnFlag = true;
+
+      } else {
+        if ((peripheral.connected()) && (descUUID.length() > 3)) {
+          if (!staleDB[advCount]) {
+            descDBCharNum[descCount] = charCount;
+            countDBDesc[devCount] = descCountPer + 1;
+          }
+          descUUID.toCharArray(descDBUUID[descCount], sizeof(descDBUUID[descCount]));
+          descDBDataLen[descCount] = (unsigned int)(dLen);
+          descCount++;
+          descCountPer++;
+          returnFlag = true;
+        } else {
+          returnFlag = false;
+          d = numDescriptors;
+        }
+      }
+    }
+
+  } else {
+    returnFlag = true;                          // no descriptors - possible condition
+  }
+
+//  Serial.print("    Descriptors return flag = ");
+//  Serial.println(returnFlag);
+  return returnFlag;
+}
+
+//************************************************************************//
+// startAdvertising (peripheral function)                                 //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void startAdvertising(void) {
+
+  if (!periphAdvertising) {
+    BLE.advertise();
+    periphAdvertising = true;
+    Serial.println("Advertising started");
+  }
+}
+
+//************************************************************************//
+// stopAdvertising (peripheral function)                                  //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void stopAdvertising(void) {
+
+  if (periphAdvertising) {
+    BLE.stopAdvertise();
+    periphAdvertising = false;
+    Serial.println("Advertising stopped");
+  }
+}
+
+//************************************************************************//
+// manageCentralConnection (peripheral function)                          //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void manageCentralConnection(void) {
+
+  if (central && !centCon) {
+    Serial.println();
+    stopAdvertising();
+    Serial.print("Connected to central: ");
+    Serial.println(central.address());          // pretty much only property available
+    centCon = true;                             // toggles to disconnected state
+    centralRunTime = millis();                  // global var - s/b 4 seconds, but ...
+    c2pDelay = C2P_DELAY_FAST;
+    p2cDelay = P2C_DELAY_FAST;
+    BLE.poll();
+  }
+  
+  if (central.connected() && (cmdPtr > MAX_CMDS)) {
+    central.disconnect();
+    delay(2);
+    if (central.connected()) BLE.disconnect();
+    Serial.println("  Pending command buffer full!  Please try later");
+  }
+  if (central.connected() && ((millis() - centralRunTime) > CENTRAL_TIMEOUT)) {
+    central.disconnect();
+    delay(2);
+    if (central.connected()) BLE.disconnect();
+    Serial.println("  Timeout has occurred - central disconnected");
+  }
+  
+  if (!central && centCon) {
+    Serial.println("Central disconnected");
+    c2pDelay = C2P_DELAY;
+    p2cDelay = P2C_DELAY;
+    startAdvertising();
+    Serial.println();
+    centCon = false;                            // toggles back to connected state
+  }
+}
+
+//************************************************************************//
+// setPeripheralAdvertising (peripheral function)                         //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+bool initPeripheralAdvertising(void) {
+
+  bool returnFlag = false;
+
+  stopAdvertising();                            // MUST turn off before making changes
+  
+  if (sizeof(periphDBUUID[advCount]) > 3) {
+    const char* pAddress;                       // pointers SUCK
+    const char* pName;                          // Nyan Cat lives
+    const char* pUUID;
+    randomSeed(long(millis()));                 // We read somewhere that one byte
+    mfgBuf[0] = byte(random(0, 256));           // should be a random value ???
+
+    pAddress = periphDBAddr[advCount];
+    pName = periphDBName[advCount];
+    pUUID = periphDBUUID[advCount];
+
+    Serial.print(" Generating advertising profile for ");
+    Serial.println(pName);
+    
+    BLE.setLocalName(pName);
+//    BLE.setDeviceName(pName);                 // scant knowledge on the forum about this
+    BLE.setManufacturerData(COMPANY_ID, mfgBuf, 2);
+    BLE.setAppearance(P_APPEARANCE);            // optional field, pushed by Arduino?
+    BLE.setConnectable(true);
+    returnFlag = true;
+  }
+  return returnFlag;
+}
+
+//************************************************************************//
+// createPeripheralServices (peripheral function)                         //
+//  inputs  : continuous loop indicator                                   //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void createPeripheralServices(void) {
+
+  byte pServCount = byte(countDBServ[advCount]);
+
+  for (int s = 0; s < pServCount; s++) {
+    const char* pServUUID = servDBUUID[advCount + s];
+//    String pServUUID = servDBUUID[advCount + s];    // easier to use as a String
+
+//    Serial.print(" Service ");
+//    Serial.print(s);
+//    Serial.print(": pServUUID = 0x");
+//    Serial.println(pServUUID);
+
+    BLEService myService(pServUUID);            // sequence is important, apparently:
+    pService[advCount + s] = myService;         // create service, then advertise it,
+//    BLE.setAdvertisedService(pService[s]);
+    createPeripheralCharacteristics((advCount + s));  // nested - just like in the central code
+    BLE.addService(pService[advCount + s]);
+
+      // alternate method - runtime instantiated services
+//    BLEService myService(pServUUID.c_str());        // sequence is important, apparently:
+//    createPeripheralCharacteristics(s, myService);
+//    BLE.addService(myService);
+  }
+  BLE.setAdvertisedServiceUuid(DEXCOM_UUID);    // needs to be after all other services!
+}
+
+//************************************************************************//
+// createPeripheralCharacteristics (peripheral function)                  //
+//  inputs  : continuous loop indicator                                   //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void createPeripheralCharacteristics(int sNum) {
+
+  byte pCharCount = byte(countDBChar[advCount]);
+
+  for (int c = 0; c < pCharCount; c++) {
+    int pServNum = charDBServNum[advCount + c];
+
+    if (pServNum == sNum) {
+
+      const char* pCharUUID = charDBUUID[advCount + c];
+      int pCharProps = charDBProps[advCount + c];
+      int pCharDataLen = charDBDataLen[advCount + c];
+
+//      Serial.print("  Characteristic ");
+//      Serial.print(c);
+//      Serial.print(": pCharUUID = 0x");
+//      Serial.print(pCharUUID);
+//      Serial.print(" [");
+//      Serial.print(pCharDataLen);
+//      Serial.print("]");
+
+//      if ((pCharDataLen > 0) && (pCharDataLen <= 512)) {
+//        for (int cd = 0; cd < pCharDataLen; cd++) {
+//        Serial.print(" ");
+//        Serial.print(charDBData[advCount + c][cd]);
+//        }
+//      }
+//      Serial.println();
+      
+      BLECharacteristic myCharacteristic(pCharUUID, pCharProps, pCharDataLen);
+      pCharacteristic[advCount + c] = myCharacteristic;
+      pService[pServNum].addCharacteristic(pCharacteristic[advCount + c]);
+      if (pCharDataLen) pCharacteristic[advCount + c].writeValue(charDBData[advCount + c], pCharDataLen);
+      activateEventHandlers((advCount + c));
+
+//      createPeripheralDescriptors((advCount + c), myCharacteristic);
+//      createPeripheralDescriptors(advCount + c);    // nested - just like in the central code
+      
+      // alternate method - runtime instantiated characteristics
+//      BLECharacteristic myCharacteristic(pCharUUID.c_str(), pCharProps, pCharDataLen);
+//      myService.addCharacteristic(myCharacteristic);
+//      createPeripheralDescriptors((advCount + c), myCharacteristic);
+//      myCharacteristic.writeValue(charDBData[advCount + c], pCharDataLen);
+    }
+  }
+}
+
+//************************************************************************//
+// createPeripheralDescriptors (peripheral function)                      //
+//  inputs  : continuous loop indicator                                   //
+//  outputs : nuthin                                                      //
+//  1 April 2021:  Descriptors not called as long as GATT.cpp has been    //
+//                 modified - ArduinoBLE makes them all, apparently       //
+//************************************************************************//
+//void createPeripheralDescriptors(int cNum) {
+void createPeripheralDescriptors(int cNum, BLECharacteristic myCharacteristic) {
+
+  byte pDescCount = byte(countDBDesc[advCount]);
+
+  for (int d = 0; d < pDescCount; d++) {
+    int pCharNum = descDBCharNum[advCount + d];
+
+    if (pCharNum == cNum) {
+
+      const char* pDescUUID = descDBUUID[advCount + d];
+      int pDescDataLen = descDBDataLen[advCount + d];
+
+//      Serial.print("   Descriptor ");
+//      Serial.print(d);
+//      Serial.print(" pDescUUID = 0x");
+//      Serial.print(pDescUUID);
+//      Serial.print(" [");
+//      Serial.print(pDescDataLen);
+//      Serial.print("]");
+
+//      if ((pDescDataLen > 0) && (pDescDataLen <= 512)) {
+//        for (int dd = 0; dd < pDescDataLen; dd++) {
+//          Serial.print(" ");
+//          Serial.print(descDBData[advCount + d][dd]);
+//        }
+//      }
+//      Serial.println();
+
+//        BLEDescriptor myDescriptor(pDescUUID, descDBData[advCount + d], pDescDataLen);
+//        pDescriptor[advCount + d] = myDescriptor;
+//        pCharacteristic[pCharNum].addDescriptor(pDescriptor[advCount + d]);
+
+      // alternate method - runtime instantiated descriptors
+      BLEDescriptor myDescriptor(pDescUUID, descDBData[advCount + d], pDescDataLen);
+      myCharacteristic.addDescriptor(myDescriptor);
+    }
+  }
+}
+
+//************************************************************************//
+// activateEventHandlers (peripheral function)                            //
+//  inputs  : local characteristic index                                  //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void activateEventHandlers(int cNum) {
+
+  //  runs once before advertising, initialises all characteristic interrupts
+  byte pCharProps = charDBProps[cNum];
+
+  if (pCharProps & BLERead) {
+    pCharacteristic[cNum].setEventHandler(BLERead, readCentralEvent);
+//    Serial.println("  Read event handlers enabled");
+  }
+
+  if (pCharProps & (BLERead | BLEWrite)) {
+    pCharacteristic[cNum].setEventHandler(BLEWritten, writeCentralEvent);
+//    Serial.println("  Write event handlers enabled");
+  }
+
+  if (pCharProps & (BLENotify | BLEIndicate)) {
+    pCharacteristic[cNum].setEventHandler(BLESubscribed, subscribeCentralEvent);
+    pCharacteristic[cNum].setEventHandler(BLEUnsubscribed, unsubscribeCentralEvent);
+    // BLEUpdated registers events but it does not propagate characteristic handle
+//    pCharacteristic[cNum].setEventHandler(BLEUpdated, retrieveUpdatedCharData);
+//    Serial.println("  Subscription event handlers enabled");
+  }
+}
+
+//************************************************************************//
+// subscribeCentralEvent (peripheral function)                            //
+//  inputs  : device and characteristic interrupt handles                 //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void subscribeCentralEvent(BLEDevice central, BLECharacteristic characteristic) {
+
+  if (cmdPtr < MAX_CMDS) {
+
+    String strUUID = characteristic.uuid();
+    strUUID.toCharArray(cmdUUID[cmdPtr], 37);   // global variable
+
+    characteristic.subscribe();
+    Serial.print("  Subscription activated for characteristic = ");
+    Serial.println(characteristic.uuid());
+    cmd[cmdPtr++] = 0x1;
+    cmdPending = true;
+    if (!centralScanning) scanForPeripherals(DEXCOM_UUID);
+
+  } else {
+    Serial.println("  Pending command buffer full!  Please try later");
+  }
+}
+
+//************************************************************************//
+// unsubscribeCentralEvent (peripheral function)                          //
+//  inputs  : device and characteristic interrupt handles                 //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void unsubscribeCentralEvent(BLEDevice central, BLECharacteristic characteristic) {
+
+  if (cmdPtr < MAX_CMDS) {
+
+    String strUUID = characteristic.uuid();
+    strUUID.toCharArray(cmdUUID[cmdPtr], 37);   // global variable
+
+    characteristic.unsubscribe();
+    Serial.print("  Subscription deactivated for characteristic = ");
+    Serial.println(characteristic.uuid());
+    cmd[cmdPtr++] = 0x2;
+    cmdPending = true;
+    if (!centralScanning) scanForPeripherals(DEXCOM_UUID);
+
+  } else {
+    Serial.println("  Pending command buffer full!  Please try later");
+  }
+}
+
+//************************************************************************//
+// writeCentralEvent (peripheral function)                                //
+//  inputs  : device and characteristic interrupt handles                 //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void writeCentralEvent(BLEDevice central, BLECharacteristic characteristic) {
+
+  // handles and important attribute info are passed in from the interrupt routine
+  // some parameters are stored globally in the "cmd" variables, too.  There is
+  // a difference between accessing "local" and "remote" GATTs as well
+
+  // somehow, the characteristic passed in has the locally written values in it
+  // so no need to attempt to store it, all that is needed is to write it remotely
+  // This is difficult functionality to understand but ... whatever works!
+
+  byte cmdCharBuf[MAX_BYTES] = {0};             // data buffer for pending writebacks
+  signed int cmdCharIndex = -1;                 // local table array pointer
+  word cmdCharDataLen = 0;                      // number of data bytes
+
+  for (int c = 0; c < charCount; c++) {         // get the characteristic table index
+    if (charDBUUID[c] == characteristic.uuid()) {
+      cmdCharIndex = c;
+      c = charCount;
+    }
+  }
+
+  // characteristic data attached to the interrupt handle
+  characteristic.read();
+  cmdCharDataLen = characteristic.valueLength();
+
+  if (cmdCharDataLen > 0) {
+    Serial.print("  Characteristic data to write: [");
+    memset(cmdCharBuf, 0, sizeof(cmdCharBuf));
+    characteristic.readValue(cmdCharBuf, cmdCharDataLen);
+    Serial.print(cmdCharDataLen);
+    Serial.print("]");
+    for (word v = 0; v < cmdCharDataLen; v++) {
+      Serial.print(" ");
+      Serial.print(cmdCharBuf[v], HEX);
+    }
+    Serial.println();
+
+    if (cmdPtr < MAX_CMDS) {
+
+      String strUUID = characteristic.uuid();
+      strUUID.toCharArray(cmdUUID[cmdPtr], 37); // global variable
+
+      Serial.print("  Scheduling characteristic ");
+      Serial.print(strUUID);
+      Serial.println(" for remote write");
+      cmd[cmdPtr++] = 0x4;
+      cmdPending = true;
+//      periphDBName[advCount][0] = '\0';
+//      staleDB[advCount] = true;
+      if (!centralScanning) scanForPeripherals(DEXCOM_UUID);
+
+    } else {
+      Serial.println("  Pending command buffer full!  Please try later");
+    }
+  } else {
+    Serial.println("  No data - write registration aborted");
+  }
+}
+
+//************************************************************************//
+// readCentralEvent (peripheral function)                                 //
+//  inputs  : device and characteristic interrupt handles                 //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void readCentralEvent(BLEDevice central, BLECharacteristic characteristic) {
+
+  if (cmdPtr < MAX_CMDS) {
+
+    String strUUID = characteristic.uuid();
+    strUUID.toCharArray(cmdUUID[cmdPtr], 37);   // global variable
+
+    Serial.print("  Scheduling characteristic ");
+    Serial.print(characteristic.uuid());
+    Serial.println(" for remote read");
+//    cmd[cmdPtr++] = 0x8;
+//    cmdPending = true;
+//    if (!centralScanning) scanForPeripherals(DEXCOM_UUID);
+
+  } else {
+    Serial.println("  Pending command buffer full!  Please try later");
+  }
+}
+
+//************************************************************************//
+// retrieveUpdatedCharData (peripheral function)                          //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void retrieveUpdatedCharData(BLEDevice central, BLECharacteristic characteristic) {
+
+    if (cmdPtr < MAX_CMDS) {
+
+    String strUUID = characteristic.uuid();
+    strUUID.toCharArray(cmdUUID[cmdPtr], 37);   // global variable
+
+    Serial.print("  Scheduling characteristic ");
+    Serial.print(characteristic.uuid());
+    Serial.println(" for remote read of updated value(s)");
+    cmd[cmdPtr++] = 0x8;
+    cmdPending = true;
+    if (!centralScanning) scanForPeripherals(DEXCOM_UUID);
+
+  } else {
+    Serial.println("  Pending command buffer full!  Please try later");
+  }
+}
+
+//************************************************************************//
+// processPendingCommand (central function)                               //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void processPendingCommands(void) {
+
+  // At this point we are a central trying to talk back to a peripheral
+  // but it has to be a specific peripheral not just any old device, Holmes
+
+  if (periphDBName[advCount] == peripheral.localName()) {
+
+    stopScanningForPeripherals();
+
+    if (connectPeripheral()) {
+
+      if (peripheral.discoverAttributes()) {
+
+        Serial.print(" Peripheral:  '");
+        Serial.print(peripheral.localName());
+        Serial.println("'");
+        byte cmdPtrTemp = cmdPtr;
+
+        for (byte cc = 0; cc < cmdPtrTemp; cc++) {
+          byte cmdCharBuf[MAX_BYTES] = {0};
+          signed int cmdCharIndex = -1;
+          word cmdCharDataLen = 0;
+
+          // access peripheral's characteristic with each pending command FIFO UUID
+          BLECharacteristic cmdCharacteristic = peripheral.characteristic(cmdUUID[cc]);
+
+          // identify which characteristic is being referenced by the event handler
+          for (int i = 0; i < charCount; i++) {
+            if (charDBUUID[advCount + i] == String(cmdUUID[cc])) {
+              cmdCharIndex = i;
+              i = charCount;
+            }
+          }
+
+          (cmdCharIndex < 0) ? cmd[cc] = 0x0 : cmd[cc];  
+
+          switch (cmd[cc]) {                      // command FIFO
+
+            case 0x1 :  cmdCharacteristic.subscribe();
+//                      Serial.print("  Subscribed to peripheral characteristic ");
+//                      Serial.println(cmdUUID[cc]);
+                        break;
+                    
+            case 0x2 :  cmdCharacteristic.unsubscribe();
+//                      Serial.print("  Unsubscribed from peripheral characteristic ");
+//                      Serial.println(cmdUUID[cc]);
+                        break;
+                    
+            case 0x4 :  pCharacteristic[cmdCharIndex].read();
+                        cmdCharDataLen = pCharacteristic[cmdCharIndex].valueLength();
+                        pCharacteristic[cmdCharIndex].readValue(cmdCharBuf, cmdCharDataLen);
+                        cmdCharacteristic.writeValue(cmdCharBuf, cmdCharDataLen);
+//                      Serial.print("  Wrote ");
+//                      Serial.print(cmdCharDataLen);
+//                      Serial.print(" bytes to peripheral characteristic ");
+//                      Serial.println(cmdUUID[cc]);
+                        break;
+
+            case 0x8 :  cmdCharacteristic.read();
+                        cmdCharDataLen = cmdCharacteristic.valueLength();
+                        cmdCharacteristic.readValue(cmdCharBuf, cmdCharDataLen);
+                        pCharacteristic[cmdCharIndex].writeValue(cmdCharBuf, cmdCharDataLen);
+//                      Serial.print("  Read ");
+//                      Serial.print(cmdCharDataLen);
+//                      Serial.print(" bytes from peripheral characteristic ");
+//                      Serial.println(cmdUUID[cc]);
+                        break;
+                                        
+            default  :  Serial.print("  Unknown characteristic or command code");
+                        Serial.println(cmd[cc], HEX);
+          }
+
+          // cleanup some pending command variables after each executes
+          memset(cmdCharBuf, 0, sizeof(cmdCharBuf));
+          cmdCharDataLen = 0;
+          cmdCharIndex = -1;
+          cmd[cc] = 0;
+          if (cmdPtrTemp) cmdPtr--;
+        }
+
+        Serial.println("  Callback commands registered");
+
+        // disconnect and stop entering the central->peripheral loop section
+        // one or more callback commands necessitates the need for a refresh cycle
+        if (peripheral.connected()) {
+          disconnectPeripheral();
+        } else {
+          Serial.println("Peripheral has already disconnected ... somehow");
+        }
+        staleDB[advCount] = true;             // callbacks sent, device s/b refreshed
+        cmdPending = false;
+        cmdPtr = 0;
+
+      } else if (sizeof(peripheral.localName()) < 3) {
+        Serial.println("Device name corruption - aborting callback!");
+        memset(cmd, 0, sizeof(cmd));
+        cmdPending = false;
+        cmdPtr = 0;
+      } else {
+        Serial.println("Peripheral failed to connect, continuing to try ...");
+        scanForPeripherals(DEXCOM_UUID);
+      }
+  
+    } else {
+      Serial.println("Peripheral failed to connect, continuing to try ...");
+      scanForPeripherals(DEXCOM_UUID);
+    }
+
+  } else {
+    Serial.print ("Wrong peripheral for callback(s) - ignoring (");
+    Serial.print(periphDBName[advCount]);
+    Serial.print(" does not equal ");
+    Serial.print(peripheral.localName());
+    Serial.println(")");
+  }
+
+  if (peripheral.connected()) disconnectPeripheral();
+}
+
+//************************************************************************//
+// heartBeat (generic function)                                           //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void heartBeat(void) {
+
+  if (hbCount == 5) {
+    hbCount = 0;
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+  } else {
+    hbCount++;
+  }
+
+  byte staleCount = 0;
+  for (byte s = 0; s < sizeof(staleDB); s++) {
+    if (staleDB[s]) staleCount++; 
+  }
+  stale = (bool)staleCount;
+
+  if (!centralScanning && stale) scanForPeripherals(DEXCOM_UUID);
+}
+
+//************************************************************************//
+// resetIndicator (generic function)                                      //
+//  inputs  : nuthin                                                      //
+//  outputs : nuthin                                                      //
+//************************************************************************//
+void resetIndicator(void) {
+
+  for (byte r = 0; r < 3; r++) {
+    digitalWrite(LED_BUILTIN, LOW);                 // flash the amber LED
+    delay(250);                                     // a few times to show the
+    digitalWrite(LED_BUILTIN, HIGH);                // Nano has come out of reset
+    delay(250);
+  }
+  digitalWrite(LED_BUILTIN, LOW);
+}
+
+  
